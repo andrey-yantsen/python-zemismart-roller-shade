@@ -172,11 +172,16 @@ class Zemismart(btle.DefaultDelegate):
                 # Single timer takes 5 bytes
                 for offset in range(0, int(int(data[2]) / 5)):
                     timer_data_start = 3 + offset * 5
+                    hours = int(data[timer_data_start + 3])
+                    if hours > 0:
+                        # I'm extremely unsure about this, but my devices report 00 for midnight,
+                        # 02 for 1AM, 09 for 8am and so on.
+                        hours -= 1
                     timer = Zemismart.Timer(
                         bool(data[timer_data_start]),
                         int(data[timer_data_start + 1]),
                         int(data[timer_data_start + 2]),
-                        int(data[timer_data_start + 3]),
+                        hours,
                         int(data[timer_data_start + 4])
                     )
                     self.timers.append(timer)
@@ -286,8 +291,10 @@ class Zemismart(btle.DefaultDelegate):
 
     def _update_timer_internal(self, timer_id, timer):
         return self.send_Zemismart_packet(self.update_timer_cmd,
-                                          bytearray([timer_id + 1, 0x00, int(timer.enabled), int(timer.position),
-                                                     int(timer.repeats), int(timer.hours), int(timer.minutes)]),
+                                          bytearray([timer_id + 1, 0x00, timer.enabled, timer.position,
+                                                     timer.repeats,
+                                                     timer.hours if timer.hours == 0 else timer.hours + 1,
+                                                     timer.minutes]),
                                           1)
 
     def timer_update(self, timer_id, timer):
