@@ -10,6 +10,48 @@ from bluepy import btle
 
 
 class Zemismart(btle.DefaultDelegate):
+    class Timer:
+        REPEAT_SUNDAY = 0x01
+        REPEAT_MONDAY = 0x02
+        REPEAT_TUESDAY = 0x04
+        REPEAT_WEDNESDAY = 0x08
+        REPEAT_THURSDAY = 0x10
+        REPEAT_FRIDAY = 0x20
+        REPEAT_SATURDAY = 0x40
+
+        REPEAT_EVERY_DAY = REPEAT_SUNDAY | REPEAT_MONDAY | REPEAT_TUESDAY | REPEAT_WEDNESDAY | REPEAT_THURSDAY \
+            | REPEAT_FRIDAY | REPEAT_SATURDAY
+
+        def __init__(self, enabled, position, repeats, hours, minutes):
+            """
+            Parameters:
+                enabled (bool): defines whether the timer is enabled or not
+                position (int): desired shares position
+                repeats (int): day when the timer should be repeated (use `binary or` to create desired combination,
+                               e.g. `Zemismart.Timer.REPEAT_SUNDAY | Zemismart.Timer.REPEAT_FRIDAY`)
+                hours (int): hour when the timer should trigger
+                minutes (int): minute when the timer should trigger
+            """
+            if type(enabled) is not bool:
+                raise AttributeError('`enabled` must be bool')
+            self.enabled = enabled
+
+            if type(position) is not int or not (0 <= position <= 100):
+                raise AttributeError('`position` must be integer between 0 and 100')
+            self.position = position
+
+            if type(repeats) is not int or repeats > self.REPEAT_EVERY_DAY:
+                raise AttributeError('`repeats` must be integer less than %d' % self.REPEAT_EVERY_DAY)
+            self.repeats = repeats
+
+            if type(hours) is not int or not (0 <= hours <= 23):
+                raise AttributeError('`hours` must be integer between 0 and 23')
+            self.hours = hours
+
+            if type(minutes) is not int or not (0 <= minutes <= 59):
+                raise AttributeError('`minutes` must be integer between 0 and 59')
+            self.minutes = minutes
+
     datahandle_uuid = "fe51"
 
     response_start_byte = 0x9a
@@ -23,6 +65,10 @@ class Zemismart(btle.DefaultDelegate):
     get_battery_cmd = bytearray.fromhex('a2')
     get_position_cmd = bytearray.fromhex('a7')
     finished_moving_cmd = bytearray.fromhex('a1')
+    update_timer_cmd = bytearray.fromhex('15')
+
+    get_timers_cmd = bytearray.fromhex('a8')
+    unknown_cmd_a9 = bytearray.fromhex('a9')
 
     open_data = bytearray.fromhex('dd')
     close_data = bytearray.fromhex('ee')
@@ -39,6 +85,8 @@ class Zemismart(btle.DefaultDelegate):
         self.withMutex = withMutex
         self.last_command_status = None
         self.iface = iface
+        self.timers = []
+        self._get_position_responses = set()
         if self.withMutex:
             self.mutex = threading.Lock()
         btle.DefaultDelegate.__init__(self)
@@ -109,16 +157,46 @@ class Zemismart(btle.DefaultDelegate):
             elif data[1] == self.get_position_cmd[0]:
                 pos = data[5]
                 self.save_position(pos)
-                self.last_command_status = True
+                self._get_position_responses.add(data[1])
+                self._check_get_position_response()
             elif data[1] == self.finished_moving_cmd[0]:
                 pos = data[4]
                 self.save_position(pos)
                 self.last_command_status = True
-            elif data[1] in (self.set_position_cmd[0], self.pin_cmd[0], self.move_cmd[0]):
+            elif data[1] == self.unknown_cmd_a9[0]:
+                self._get_position_responses.add(data[1])
+                self._check_get_position_response()
+            elif data[1] == self.get_timers_cmd[0]:
+                self._get_position_responses.add(data[1])
+                self.timers = []
+                # Single timer takes 5 bytes
+                for offset in range(0, int(int(data[2]) / 5)):
+                    timer_data_start = 3 + offset * 5
+                    timer = Zemismart.Timer(
+                        bool(data[timer_data_start]),
+                        int(data[timer_data_start + 1]),
+                        int(data[timer_data_start + 2]),
+                        int(data[timer_data_start + 3]),
+                        int(data[timer_data_start + 4])
+                    )
+                    self.timers.append(timer)
+
+                self._check_get_position_response()
+            elif data[1] in (self.set_position_cmd[0], self.pin_cmd[0], self.move_cmd[0], self.update_timer_cmd[0]):
                 if data[3] == 0x5A:
                     self.last_command_status = True
                 elif data[3] == 0xA5:
                     self.last_command_status = False
+
+    def _check_get_position_response(self):
+        """
+        Command 0xA7 (get_position) yields three responses from the device. We can't treat the command result as
+        a success, unless we have receieved all of them.
+        This method checks that since the last update() call, where self._get_position_responses is reset, we
+        receieved all the required responses.
+        """
+        if self._get_position_responses == {self.get_position_cmd[0], self.get_timers_cmd[0], self.unknown_cmd_a9[0]}:
+            self.last_command_status = True
 
     def login(self):
         pin_data = bytearray(struct.pack(">H", self.pin))
@@ -172,9 +250,64 @@ class Zemismart(btle.DefaultDelegate):
         self.battery = battery
 
     def update(self):
+        self._get_position_responses = set()
         if not self.send_Zemismart_packet(self.get_position_cmd, bytearray([0x01]), 1):
             return False
         elif not self.send_Zemismart_packet(self.get_battery_cmd, bytearray([0x01]), 1):
             return False
         else:
             return True
+
+    def timer_toggle(self, timer_id, enabled):
+        if timer_id >= len(self.timers):
+            raise IndexError('Timer #%d not found' % timer_id)
+
+        ret = self.send_Zemismart_packet(self.update_timer_cmd,
+                                         bytearray([timer_id + 1, 0x00, int(enabled), 0x00, 0x00, 0x00, 0x00]),
+                                         1)
+
+        if ret:
+            self.timers[timer_id - 1].enabled = enabled
+
+        return ret
+
+    def timer_delete(self, timer_id):
+        if timer_id >= len(self.timers):
+            raise IndexError('Timer #%d not found' % timer_id)
+
+        ret = self.send_Zemismart_packet(self.update_timer_cmd,
+                                         bytearray([timer_id + 1, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]),
+                                         1)
+
+        if ret:
+            del self.timers[timer_id - 1]
+
+        return ret
+
+    def _update_timer_internal(self, timer_id, timer):
+        return self.send_Zemismart_packet(self.update_timer_cmd,
+                                          bytearray([timer_id + 1, 0x00, int(timer.enabled), int(timer.position),
+                                                     int(timer.repeats), int(timer.hours), int(timer.minutes)]),
+                                          1)
+
+    def timer_update(self, timer_id, timer):
+        if timer_id >= len(self.timers):
+            raise IndexError('Timer #%d not found' % timer_id)
+
+        ret = self._update_timer_internal(timer_id, timer)
+
+        if ret:
+            self.timers[timer_id] = timer
+
+        return ret
+
+    def timer_add(self, timer):
+        if len(self.timers) >= 4:
+            raise ValueError('You can have only 4 timers')
+
+        ret = self._update_timer_internal(len(self.timers) - 1, timer)
+
+        if ret:
+            self.timers.append(timer)
+
+        return ret
